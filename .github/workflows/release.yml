@@ -1,0 +1,67 @@
+name: Release
+
+# Pushing a tag like v0.1.0 builds Zquig, attaches it to a GitHub release with SHA-256
+# checksums, and records a signed build-provenance attestation for the files.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    permissions:
+      contents: write      # create the release
+      id-token: write      # sign the provenance attestation
+      attestations: write  # store it
+    env:
+      # Passed through the environment, never pasted into scripts, so a tag name can't inject commands.
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Check the tag matches Cargo.toml
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ($env:TAG -ne "v$version") { throw "Tag $env:TAG doesn't match Cargo.toml version $version" }
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build and package
+        shell: pwsh
+        run: ./package.ps1
+
+      - name: Checksums
+        shell: pwsh
+        run: |
+          Copy-Item target/release/zquig.exe dist/zquig.exe
+          Get-FileHash dist/Zquig-windows.zip, dist/zquig.exe -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $(Split-Path $_.Path -Leaf)" } |
+            Set-Content dist/SHA256SUMS.txt -Encoding ascii
+          Get-Content dist/SHA256SUMS.txt
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/Zquig-windows.zip
+            dist/zquig.exe
+
+      - name: Publish release
+        shell: pwsh
+        run: |
+          gh release create $env:TAG dist/Zquig-windows.zip dist/zquig.exe dist/SHA256SUMS.txt `
+            --title "Zquig $env:TAG" --generate-notes --verify-tag

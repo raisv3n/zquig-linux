@@ -1,0 +1,61 @@
+[package]
+name = "zquig"
+version = "0.1.0"
+edition = "2024"
+description = "Screenshot annotation app for Windows"
+repository = "https://github.com/raisv3n/zquig-rs"
+rust-version = "1.88"
+publish = false
+license-file = "LICENSE"
+
+[dependencies]
+arboard = "3.7.0"
+clipboard-win = "5.4.1"
+cosmic-text = "0.19.0"
+drag = "2.1.1"
+egui = "0.36"
+egui-phosphor = "0.14.0"
+egui-wgpu = { version = "0.36", features = ["winit"] }
+egui-winit = "0.36"
+global-hotkey = "0.8.0"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "tiff", "bmp", "gif", "webp", "ico"] }
+interprocess = "2.4.5"
+miniz_oxide = "0.9.1"
+pollster = "1.0.1"
+rfd = { version = "0.17.2", features = ["common-controls-v6"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tiny-skia = "0.12.0"
+tray-icon = "0.26.1"
+winit = "0.30"
+
+[dependencies.windows]
+version = "0.62"
+features = [
+    "Foundation",
+    "Data_Pdf",
+    "Storage",
+    "Storage_Streams",
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[build-dependencies]
+embed-resource = "3.0.12"
+image = { version = "0.25.10", default-features = false, features = ["png", "ico"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 2
