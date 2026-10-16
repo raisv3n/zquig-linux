@@ -40,7 +40,7 @@ rfd = { version = "0.17.2", default-features = false, features = ["gtk3"] }
 tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
 # Keyboard grab for the capture overlay, on winit's own Xlib connection (winit already loads x11-dl).
 x11-dl = "2.21"
-x11rb = { version = "0.13", features = ["randr", "xfixes", "xtest"] }
+x11rb = { version = "0.14", features = ["randr", "xfixes", "xtest"] }
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
