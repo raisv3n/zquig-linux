@@ -5,7 +5,11 @@ mod canvas;
 mod capture;
 mod document;
 mod imageio;
+#[cfg_attr(windows, path = "os/windows.rs")]
+#[cfg_attr(target_os = "linux", path = "os/linux.rs")]
+mod os;
 mod overlay;
+mod peek;
 mod render;
 #[cfg(debug_assertions)]
 mod replay;
@@ -31,12 +35,12 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::platform::windows::WindowAttributesExtWindows;
 use winit::window::{Icon, Window, WindowAttributes, WindowId, WindowLevel};
 
 use capture::Mode;
 use document::{Action, Document};
 use overlay::{Outcome, Overlay};
+use peek::Peek;
 use system::{Prefs, Request};
 use toast::Toast;
 
@@ -52,12 +56,15 @@ enum UserEvent {
     Capture(Mode),
     KeyboardSettingsChanged,
     RetakePrintScreen,
+    /// Space on files in the file manager.
+    Peek(Vec<PathBuf>),
 }
 
 enum Kind {
     Doc(Box<Document>),
     Overlay(Box<Overlay>),
     Toast(Box<Toast>),
+    Peek(Box<Peek>),
 }
 
 struct Win {
@@ -98,19 +105,33 @@ struct App {
     /// Editor windows hidden while an editor capture is in progress.
     hidden: Vec<WindowId>,
     capturing: bool,
+    /// Whether Zquig holds the Print Screen key (another app may have it).
+    print_screen_registered: bool,
     #[cfg(debug_assertions)]
     replay: Option<replay::Replay>,
 }
 
-/// DirectX 12 (OpenGL as a fallback). wgpu would otherwise try Vulkan first, and Vulkan overlay
-/// layers that some apps install (game recorders, chat overlays) can hang device creation.
+/// The platform's preferred graphics backends (see `os::gpu_backends`).
 /// A screenshot tool doesn't need the discrete GPU, so prefer the power-saving one.
 fn gpu_config() -> egui_wgpu::WgpuConfiguration {
     use egui_wgpu::wgpu;
     let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
-    setup.instance_descriptor.backends = wgpu::Backends::from_env().unwrap_or(wgpu::Backends::DX12 | wgpu::Backends::GL);
+    setup.instance_descriptor.backends = wgpu::Backends::from_env().unwrap_or(os::gpu_backends());
     setup.power_preference = wgpu::PowerPreference::from_env().unwrap_or(wgpu::PowerPreference::LowPower);
     egui_wgpu::WgpuConfiguration { wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(setup), ..Default::default() }
+}
+
+/// Takes each monitor's scale from winit, so the logical sizes Zquig asks for match what winit does with them.
+fn sync_scales(el: &ActiveEventLoop, monitors: &mut [capture::Monitor], origin: (i32, i32)) {
+    for m in monitors {
+        let at = (m.rect.min.x as i32 + origin.0, m.rect.min.y as i32 + origin.1);
+        if let Some(h) = el.available_monitors().find(|h| {
+            let p = h.position();
+            (p.x, p.y) == at
+        }) {
+            m.scale = h.scale_factor() as f32;
+        }
+    }
 }
 
 fn app_icon() -> Option<(Vec<u8>, u32, u32)> {
@@ -127,6 +148,13 @@ impl App {
     // MARK: Windows
 
     fn add_window(&mut self, el: &ActiveEventLoop, attrs: WindowAttributes, kind: Kind) -> Option<WindowId> {
+        let id = self.add_hidden_window(el, attrs, kind)?;
+        self.show_window(el, id);
+        Some(id)
+    }
+
+    /// Creates a window and its renderer without showing it.
+    fn add_hidden_window(&mut self, el: &ActiveEventLoop, attrs: WindowAttributes, kind: Kind) -> Option<WindowId> {
         let window = Arc::new(el.create_window(attrs.with_visible(false)).ok()?);
         let viewport = ViewportId::from_hash_of(("zquig", self.next_id));
         self.next_id += 1;
@@ -154,6 +182,10 @@ impl App {
         egui_winit::update_viewport_info(&mut info, &self.ctx, &window, true);
         let id = window.id();
         self.wins.insert(id, Win { window, state, viewport, info, kind, repaint_at: None });
+        Some(id)
+    }
+
+    fn show_window(&mut self, el: &ActiveEventLoop, id: WindowId) {
         // Paint before showing, so the window never flashes white.
         self.redraw(el, id);
         self.redraw(el, id);
@@ -164,7 +196,6 @@ impl App {
             }
             w.window.request_redraw();
         }
-        Some(id)
     }
 
     fn remove_window(&mut self, id: WindowId) {
@@ -175,10 +206,10 @@ impl App {
         }
     }
 
-    fn primary_work_area() -> (egui::Rect, f32) {
-        let monitors = capture::monitor_list();
-        let primary = monitors.iter().find(|m| m.rect.contains(egui::pos2(0.0, 0.0))).or(monitors.first());
-        primary.map_or((egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0)), 1.0), |m| (m.work, m.scale))
+    fn primary_work_area(el: &ActiveEventLoop) -> (egui::Rect, f32) {
+        let mut monitors = capture::monitor_list();
+        sync_scales(el, &mut monitors, (0, 0));
+        capture::primary(&monitors).map_or((egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0)), 1.0), |m| (m.work, m.scale))
     }
 
     fn next_title(&mut self) -> String {
@@ -188,11 +219,11 @@ impl App {
 
     fn present(&mut self, el: &ActiveEventLoop, image: Pixmap, scale: f32, title: String, path: Option<PathBuf>) {
         let doc = Document::new(image, scale, title.clone(), path, &self.prefs, self.next_id);
-        let (work, mscale) = Self::primary_work_area();
+        let (work, mscale) = Self::primary_work_area(el);
         let size = doc.preferred_size(work.size() / mscale);
         let phys = size * mscale;
         let pos = work.center() - phys / 2.0;
-        let mut attrs = Window::default_attributes()
+        let mut attrs = os::editor_attrs(Window::default_attributes())
             .with_title(doc.window_title())
             .with_inner_size(LogicalSize::new(size.x, size.y))
             .with_min_inner_size(LogicalSize::new(560.0, 360.0))
@@ -307,12 +338,13 @@ impl App {
     }
 
     fn do_capture(&mut self, el: &ActiveEventLoop, mode: Mode) {
-        let Some(desktop) = capture::grab() else {
+        let Some(mut desktop) = capture::grab() else {
             self.capturing = false;
             self.restore_hidden();
-            document::error_box(None, "Couldn't capture the screen", "Windows didn't return an image.");
+            document::error_box(None, "Couldn't capture the screen", os::CAPTURE_FAILED);
             return;
         };
+        sync_scales(el, &mut desktop.monitors, desktop.origin);
         if !mode.is_interactive() {
             let full = desktop.full();
             self.finish_capture(el, mode, &desktop, full);
@@ -320,12 +352,11 @@ impl App {
         }
         let (x, y) = desktop.origin;
         let (w, h) = (desktop.image.width(), desktop.image.height());
-        let attrs = Window::default_attributes()
+        let attrs = os::overlay_attrs(Window::default_attributes())
             .with_title("Zquig Capture")
             .with_decorations(false)
             .with_resizable(false)
             .with_window_level(WindowLevel::AlwaysOnTop)
-            .with_skip_taskbar(true)
             .with_position(PhysicalPosition::new(x, y))
             .with_inner_size(PhysicalSize::new(w, h));
         if self.add_window(el, attrs, Kind::Overlay(Box::new(Overlay::new(desktop, mode)))).is_none() {
@@ -351,7 +382,7 @@ impl App {
                 let path = capture::screenshot_path("jpg");
                 let (img, target) = (image.clone(), path.clone());
                 std::thread::spawn(move || {
-                    if let Err(e) = imageio::write_atomic(&target, &imageio::encode_jpeg(&img, 90)) {
+                    if let Err(e) = imageio::write_private(&target, &imageio::encode_jpeg(&img, 90)) {
                         document::error_box(None, &format!("Couldn't save {}", target.display()), &e);
                     }
                 });
@@ -371,25 +402,74 @@ impl App {
         }
         // Bottom-right of the primary monitor's work area.
         let (ox, oy) = desktop.origin;
-        let primary = desktop
-            .monitors
-            .iter()
-            .find(|m| m.rect.contains(egui::pos2(-ox as f32, -oy as f32)))
-            .or(desktop.monitors.first());
-        let (work, s) = primary.map_or((desktop.full(), 1.0), |m| (m.work, m.scale));
+        let (work, s) = capture::primary(&desktop.monitors).map_or((desktop.full(), 1.0), |m| (m.work, m.scale));
         let size = toast::SIZE * s;
         let margin = 16.0 * s;
         let pos = work.max - size - egui::vec2(margin, margin);
-        let attrs = Window::default_attributes()
+        let attrs = os::toast_attrs(Window::default_attributes())
             .with_title("Zquig")
             .with_decorations(false)
             .with_resizable(false)
             .with_active(false)
             .with_window_level(WindowLevel::AlwaysOnTop)
-            .with_skip_taskbar(true)
             .with_inner_size(PhysicalSize::new(size.x as u32, size.y as u32))
             .with_position(PhysicalPosition::new((pos.x as i32) + ox, (pos.y as i32) + oy));
         self.add_window(el, attrs, Kind::Toast(Box::new(toast)));
+    }
+
+    fn peek_window(&self) -> Option<WindowId> {
+        self.wins.iter().find(|(_, w)| matches!(w.kind, Kind::Peek(_))).map(|(id, _)| *id)
+    }
+
+    /// Creates the preview window ahead of time, hidden: setting up a window's renderer takes
+    /// most of a second, far too long to wait after pressing Space.
+    fn prepare_peek(&mut self, el: &ActiveEventLoop) {
+        if os::FILE_MANAGER_PREVIEW && self.peek_window().is_none() {
+            let attrs = Self::peek_attrs().with_inner_size(LogicalSize::new(480.0, 320.0));
+            self.add_hidden_window(el, attrs, Kind::Peek(Box::new(Peek::closed())));
+        }
+    }
+
+    fn peek_attrs() -> WindowAttributes {
+        let mut attrs = os::editor_attrs(Window::default_attributes()).with_title("Zquig").with_window_level(WindowLevel::AlwaysOnTop);
+        if let Some((rgba, w, h)) = app_icon() {
+            attrs = attrs.with_window_icon(Icon::from_rgba(rgba, w, h).ok());
+        }
+        attrs
+    }
+
+    /// The Quick Look-style preview: centred on the primary monitor, floating above the file manager.
+    fn show_peek(&mut self, el: &ActiveEventLoop, paths: Vec<PathBuf>) {
+        let peek = Peek::new(paths);
+        let (work, mscale) = Self::primary_work_area(el);
+        let avail = work.size() / mscale * 0.75;
+        let natural = peek.natural_size().unwrap_or(egui::vec2(480.0, 320.0));
+        let fit = (avail.x / natural.x).min((avail.y - peek::BAR) / natural.y).min(1.0);
+        let size = (natural * fit + egui::vec2(24.0, peek::BAR + 24.0)).max(egui::vec2(420.0, 260.0));
+        let pos = work.center() - size * mscale / 2.0;
+        let pos = PhysicalPosition::new(pos.x as i32, pos.y as i32);
+        let title = peek.window_title();
+        if let Some(id) = self.peek_window()
+            && let Some(w) = self.wins.get_mut(&id)
+        {
+            // Reuse the window: new content, size and place, then show it.
+            w.kind = Kind::Peek(Box::new(peek));
+            w.window.set_title(&title);
+            let _ = w.window.request_inner_size(LogicalSize::new(size.x, size.y));
+            w.window.set_outer_position(pos);
+            self.show_window(el, id);
+        } else {
+            let attrs = Self::peek_attrs().with_title(title).with_inner_size(LogicalSize::new(size.x, size.y)).with_position(pos);
+            self.add_window(el, attrs, Kind::Peek(Box::new(peek)));
+        }
+    }
+
+    /// Hides the preview, keeping the window for next time.
+    fn hide_peek(&mut self, id: WindowId) {
+        if let Some(w) = self.wins.get_mut(&id) {
+            w.window.set_visible(false);
+            w.kind = Kind::Peek(Box::new(Peek::closed()));
+        }
     }
 
     // MARK: Frame
@@ -407,7 +487,7 @@ impl App {
         let replaying = match w.kind {
             Kind::Overlay(_) => true,
             Kind::Doc(_) => !overlay_open,
-            Kind::Toast(_) => false,
+            Kind::Toast(_) | Kind::Peek(_) => false,
         } && self.replay.as_mut().is_some_and(|r| r.feed(&mut input));
         let mut actions = Vec::new();
         let window = w.window.clone();
@@ -415,13 +495,30 @@ impl App {
             Kind::Doc(doc) => doc.ui(ui, &window, &mut actions),
             Kind::Overlay(o) => o.ui(ui),
             Kind::Toast(t) => t.ui(ui),
+            Kind::Peek(p) => p.ui(ui),
         });
+        if let Kind::Peek(p) = &mut w.kind
+            && let Some(title) = p.retitle.take()
+        {
+            w.window.set_title(&title);
+        }
         w.state.handle_platform_output(&w.window, std::mem::take(&mut out.platform_output));
         let prims = self.ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
         let clear = egui::Rgba::from(self.ctx.global_style().visuals.panel_fill).to_array();
         painter.paint_and_update_textures(w.viewport, out.pixels_per_point, clear, &prims, &mut out.textures_delta, vec![], &w.window);
-        if let Some(vo) = out.viewport_output.get(&w.viewport) {
-            self.schedule(id, vo.repaint_delay);
+        let mut delay = out.viewport_output.get(&w.viewport).map(|vo| vo.repaint_delay);
+        // The overlay needs the keyboard for Space and Esc. The shortcut that started the capture can
+        // still hold it (until its keys are released), so keep trying.
+        if let Kind::Overlay(o) = &mut w.kind
+            && !o.keyboard_grabbed
+        {
+            o.keyboard_grabbed = os::grab_keyboard(&w.window);
+            if !o.keyboard_grabbed {
+                delay = Some(delay.map_or(Duration::from_millis(50), |d| d.min(Duration::from_millis(50))));
+            }
+        }
+        if let Some(delay) = delay {
+            self.schedule(id, delay);
         }
         #[cfg(debug_assertions)]
         if replaying {
@@ -468,6 +565,13 @@ impl App {
                     }
                 }
             }
+            Kind::Peek(p) if p.done && p.is_open() => {
+                let open = p.open.take();
+                self.hide_peek(id);
+                if let Some(path) = open {
+                    self.open_path(el, &path);
+                }
+            }
             Kind::Toast(t) if t.done => {
                 let Some(Kind::Toast(t)) = self.wins.remove(&id).map(|w| w.kind) else { return };
                 self.remove_window(id);
@@ -505,7 +609,7 @@ impl App {
         )
         .ok();
         self.update_print_screen_item();
-        let autostart = CheckMenuItem::new("Start with Windows", true, system::starts_with_windows(), None);
+        let autostart = CheckMenuItem::new(system::AUTOSTART_LABEL, true, system::starts_at_login(), None);
         let quit = MenuItem::new("Quit Zquig", true, None);
         let menu = Menu::new();
         let sep = PredefinedMenuItem::separator();
@@ -561,13 +665,17 @@ impl App {
             (None, Code::PrintScreen, "Print Screen", Mode::ScreenToFile),
         ] {
             let hk = HotKey::new(mods, code);
-            match mgr.register(hk) {
-                Ok(()) => {
+            let ok = mgr.register(hk).is_ok();
+            if code == Code::PrintScreen {
+                self.print_screen_registered = ok;
+            }
+            match ok {
+                true => {
                     self.hotkey_modes.insert(hk.id(), mode);
                 }
                 // The tray's Shortcuts menu explains this case; no need for a message box.
-                Err(_) if code == Code::PrintScreen && system::snipping_owns_print_screen() => {}
-                Err(_) => failed.push(name),
+                false if code == Code::PrintScreen && system::print_screen_taken_by(false).is_some() => {}
+                false => failed.push(name),
             }
         }
         let p = self.proxy.clone();
@@ -577,9 +685,14 @@ impl App {
             }
         }));
         self.hotkeys = Some(mgr);
+        self.update_print_screen_item();
         let p = self.proxy.clone();
         system::watch_keyboard_settings(move || {
             let _ = p.lock().unwrap().send_event(UserEvent::KeyboardSettingsChanged);
+        });
+        let p = self.proxy.clone();
+        os::watch_file_manager(move |paths| {
+            let _ = p.lock().unwrap().send_event(UserEvent::Peek(paths));
         });
         if !failed.is_empty() {
             document::error_box(
@@ -608,7 +721,8 @@ impl App {
         if let Some(mgr) = &self.hotkeys {
             let hk = HotKey::new(None, Code::PrintScreen);
             let _ = mgr.unregister(hk);
-            if mgr.register(hk).is_ok() {
+            self.print_screen_registered = mgr.register(hk).is_ok();
+            if self.print_screen_registered {
                 self.hotkey_modes.insert(hk.id(), Mode::ScreenToFile);
             }
         }
@@ -616,28 +730,27 @@ impl App {
     }
 
     fn update_print_screen_item(&self) {
-        self.print_screen_item.set_text(if system::snipping_owns_print_screen() {
-            "Print Screen    (taken by Snipping Tool \u{2014} see Settings > Accessibility > Keyboard)"
-        } else {
-            "Print Screen    Full screen \u{2192} JPEG"
+        self.print_screen_item.set_text(match system::print_screen_taken_by(self.print_screen_registered) {
+            Some(owner) => format!("Print Screen    (taken by {owner})"),
+            None => "Print Screen    Full screen \u{2192} JPEG".into(),
         });
     }
 
     fn setup_fonts(&self) {
         let mut fonts = egui::FontDefinitions::default();
         egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
-        let dir = PathBuf::from(std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into())).join("Fonts");
-        if let Ok(bytes) = std::fs::read(dir.join("segoeui.ttf")) {
-            fonts.font_data.insert("segoe".into(), Arc::new(egui::FontData::from_owned(bytes)));
+        let (regular, bold) = os::ui_fonts();
+        if let Some(bytes) = regular {
+            fonts.font_data.insert("system".into(), Arc::new(egui::FontData::from_owned(bytes)));
             if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-                f.insert(0, "segoe".into());
+                f.insert(0, "system".into());
             }
         }
         let fallback = fonts.families.get(&egui::FontFamily::Proportional).cloned().unwrap_or_default();
         let mut annotation = fallback.clone();
-        if let Ok(bytes) = std::fs::read(dir.join("segoeuib.ttf")) {
-            fonts.font_data.insert("segoe-bold".into(), Arc::new(egui::FontData::from_owned(bytes)));
-            annotation.insert(0, "segoe-bold".into());
+        if let Some(bytes) = bold {
+            fonts.font_data.insert("system-bold".into(), Arc::new(egui::FontData::from_owned(bytes)));
+            annotation.insert(0, "system-bold".into());
         }
         fonts.families.insert(egui::FontFamily::Name(document::ANNOTATION_FONT.into()), annotation);
         self.ctx.set_fonts(fonts);
@@ -665,6 +778,7 @@ impl ApplicationHandler<UserEvent> for App {
         self.setup_fonts();
         self.setup_tray();
         self.setup_hotkeys();
+        self.prepare_peek(el);
         if let Some(req) = self.startup.take() {
             self.handle_request(el, req);
         }
@@ -685,6 +799,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Capture(mode) => self.do_capture(el, mode),
             UserEvent::KeyboardSettingsChanged => self.on_keyboard_settings_changed(),
             UserEvent::RetakePrintScreen => self.retake_print_screen(),
+            UserEvent::Peek(paths) => self.show_peek(el, paths),
             UserEvent::TrayClick => self.show_all(el),
             UserEvent::Menu(id) => {
                 let Some(ids) = &self.tray_ids else { return };
@@ -699,12 +814,12 @@ impl ApplicationHandler<UserEvent> for App {
                 } else if id == ids.open {
                     self.open_dialog(el);
                 } else if id == ids.folder {
-                    let _ = std::process::Command::new("explorer").arg(capture::screenshots_dir()).spawn();
+                    os::open_folder(&capture::screenshots_dir());
                 } else if id == ids.autostart {
-                    let on = !system::starts_with_windows();
-                    system::set_starts_with_windows(on);
+                    let on = !system::starts_at_login();
+                    system::set_starts_at_login(on);
                     if let Some(item) = &self.autostart_item {
-                        item.set_checked(system::starts_with_windows());
+                        item.set_checked(system::starts_at_login());
                     }
                 } else if id == ids.quit {
                     self.quit(el);
@@ -737,6 +852,7 @@ impl ApplicationHandler<UserEvent> for App {
                         self.after_frame(el, id, Vec::new());
                     }
                     Kind::Toast(_) => self.remove_window(id),
+                    Kind::Peek(_) => self.hide_peek(id),
                 }
                 return;
             }
@@ -806,7 +922,7 @@ fn main() {
         Request::Show
     };
 
-    // A second launch (e.g. "Open with" from Explorer) hands over to the running copy, which owns the hotkeys.
+    // A second launch (e.g. "Open with" from the file manager) hands over to the running copy, which owns the hotkeys.
     if system::forward(&request) {
         return;
     }
@@ -843,6 +959,7 @@ fn main() {
         print_screen_item: MenuItem::new("Print Screen    Full screen \u{2192} JPEG", false, None),
         hidden: Vec::new(),
         capturing: false,
+        print_screen_registered: false,
         #[cfg(debug_assertions)]
         replay: replay::Replay::from_env(),
     };

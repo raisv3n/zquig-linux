@@ -25,7 +25,7 @@ jobs:
           persist-credentials: false
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        run: cargo install cargo-audit --locked --version 0.22.2
 
       - name: Audit
         run: cargo audit

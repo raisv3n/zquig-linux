@@ -2,17 +2,15 @@
 name = "zquig"
 version = "0.1.0"
 edition = "2024"
-description = "Screenshot annotation app for Windows"
-repository = "https://github.com/raisv3n/zquig-rs"
+description = "Screenshot annotation app for Linux"
+repository = "https://github.com/raisv3n/zquig-linux"
 rust-version = "1.88"
 publish = false
 license-file = "LICENSE"
 
 [dependencies]
 arboard = "3.7.0"
-clipboard-win = "5.4.1"
 cosmic-text = "0.19.0"
-drag = "2.1.1"
 egui = "0.36"
 egui-phosphor = "0.14.0"
 egui-wgpu = { version = "0.36", features = ["winit"] }
@@ -22,14 +20,29 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 interprocess = "2.4.5"
 miniz_oxide = "0.9.1"
 pollster = "1.0.1"
-rfd = { version = "0.17.2", features = ["common-controls-v6"] }
+rfd = { version = "0.17.2", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tiny-skia = "0.12.0"
-tray-icon = "0.26.1"
+tray-icon = { version = "0.26.1", default-features = false }
 winit = "0.30"
 
-[dependencies.windows]
+[target.'cfg(windows)'.dependencies]
+clipboard-win = "5.4.1"
+drag = "2.1.1"
+rfd = { version = "0.17.2", features = ["common-controls-v6"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+# GTK 3 dialogs; the default portal backend needs zenity for message boxes, which few desktops ship.
+rfd = { version = "0.17.2", default-features = false, features = ["gtk3"] }
+# The tray talks to the panel over D-Bus (StatusNotifierItem), so it needs no GTK main loop of its own.
+tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
+# Keyboard grab for the capture overlay, on winit's own Xlib connection (winit already loads x11-dl).
+x11-dl = "2.21"
+x11rb = { version = "0.13", features = ["randr", "xfixes", "xtest"] }
+
+[target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
 features = [
     "Foundation",
@@ -51,6 +64,33 @@ features = [
 [build-dependencies]
 embed-resource = "3.0.12"
 image = { version = "0.25.10", default-features = false, features = ["png", "ico"] }
+
+# `cargo deb` builds the .deb for releases (see package.sh).
+[package.metadata.deb]
+maintainer = "raisv3n <15613990+raisv3n@users.noreply.github.com>"
+copyright = "raisv3n"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+Press a shortcut to grab the screen, a region or a window, then mark it up with arrows, \
+boxes, text, numbered steps, a highlighter or pixelation, and save or paste it anywhere. \
+Zquig also opens images and PDFs, and Space in the file manager previews images it opens. \
+Needs an X11 session."""
+section = "graphics"
+priority = "optional"
+# $auto finds the libraries Zquig links to (GTK, glib); the X11, keyboard and GPU libraries
+# are loaded at run time, so they're listed by hand.
+depends = "$auto, libx11-6, libx11-xcb1, libxcb1, libxcursor1, libxi6, libxkbcommon0, libxkbcommon-x11-0, libvulkan1 | libegl1"
+recommends = "poppler-utils, fontconfig, xdg-utils, mesa-vulkan-drivers | libegl-mesa0"
+assets = [
+    ["target/release/zquig", "usr/bin/", "755"],
+    ["packaging/zquig.desktop", "usr/share/applications/", "644"],
+    ["packaging/icons/zquig-48.png", "usr/share/icons/hicolor/48x48/apps/zquig.png", "644"],
+    ["packaging/icons/zquig-128.png", "usr/share/icons/hicolor/128x128/apps/zquig.png", "644"],
+    ["packaging/icons/zquig-256.png", "usr/share/icons/hicolor/256x256/apps/zquig.png", "644"],
+    ["packaging/icons/zquig-512.png", "usr/share/icons/hicolor/512x512/apps/zquig.png", "644"],
+    ["README.md", "usr/share/doc/zquig/", "644"],
+    ["SECURITY.md", "usr/share/doc/zquig/", "644"],
+]
 
 [profile.release]
 lto = "thin"

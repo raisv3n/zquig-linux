@@ -5,9 +5,8 @@ use std::sync::{Mutex, OnceLock};
 
 use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, SwashContent, Weight, Wrap};
 
-/// Segoe UI is the Windows UI face; bold matches the Mac app's `systemFont(weight: .bold)`.
-const FAMILY: &str = "Segoe UI";
-/// Segoe UI's natural line height (ascent + descent) relative to its em size.
+/// Segoe UI's natural line height (ascent + descent) relative to its em size; close enough for
+/// the Linux faces (Noto Sans, DejaVu Sans) too.
 const LINE_HEIGHT: f32 = 1.33;
 
 struct Engine {
@@ -34,7 +33,7 @@ fn layout(fonts: &mut FontSystem, text: &str, size: f32, wrap: f32) -> Buffer {
     let mut buf = Buffer::new(fonts, Metrics::new(size, size * LINE_HEIGHT));
     buf.set_wrap(Wrap::WordOrGlyph);
     buf.set_size(Some(wrap.max(1.0)), None);
-    let attrs = Attrs::new().family(Family::Name(FAMILY)).weight(Weight::BOLD);
+    let attrs = Attrs::new().family(Family::Name(crate::os::text_family())).weight(Weight::BOLD);
     buf.set_text(text, &attrs, Shaping::Advanced, None);
     buf.shape_until_scroll(fonts, false);
     buf

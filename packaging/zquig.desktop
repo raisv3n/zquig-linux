@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Zquig
+GenericName=Screenshot Annotator
+Comment=Capture the screen and mark up images and PDFs
+Exec=zquig %F
+Icon=zquig
+Terminal=false
+Categories=Graphics;2DGraphics;RasterGraphics;
+MimeType=image/png;image/jpeg;image/bmp;image/gif;image/tiff;image/webp;image/vnd.microsoft.icon;image/x-icon;application/pdf;
+StartupWMClass=Zquig

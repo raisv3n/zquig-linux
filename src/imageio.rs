@@ -2,9 +2,12 @@
 
 use std::io::Write;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 use image::{ImageEncoder, RgbaImage};
 use tiny_skia::{IntSize, Pixmap};
+
+pub use crate::os::{clipboard_has_image, render_pdf};
 
 pub fn pixmap_from_rgba(img: RgbaImage) -> Option<Pixmap> {
     let (w, h) = img.dimensions();
@@ -88,7 +91,7 @@ fn encode_tiff(pix: &Pixmap) -> Result<Vec<u8>, String> {
 }
 
 /// A one-page PDF holding the image. `scale` is pixels per point; the page keeps the
-/// image's on-screen size (Windows points are 1/96 inch, PDF points 1/72).
+/// image's on-screen size (screen points are 1/96 inch, PDF points 1/72).
 fn encode_pdf(pix: &Pixmap, scale: f32) -> Vec<u8> {
     let (w, h) = (pix.width(), pix.height());
     let page_w = w as f32 / scale * 0.75;
@@ -148,12 +151,40 @@ pub fn save(pix: &Pixmap, scale: f32, path: &Path) -> Result<(), String> {
 }
 
 pub fn write_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
-    let tmp = path.with_extension(format!(
-        "{}.zquig-tmp",
-        path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default()
-    ));
-    std::fs::write(&tmp, data).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| {
+    write_atomic_mode(path, data, None)
+}
+
+/// Like `write_atomic`, but readable only by this user (screenshots can hold anything on screen).
+pub fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
+    write_atomic_mode(path, data, Some(0o600))
+}
+
+/// Writes to a temporary file next to `path`, then renames it over `path`. The temporary file is
+/// created fresh (never opened if something already has its name, such as a symlink planted in a
+/// shared folder), with a random suffix.
+fn write_atomic_mode(path: &Path, data: &[u8], mode: Option<u32>) -> Result<(), String> {
+    use std::hash::{BuildHasher, Hasher};
+    let ext = path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut attempt = 0;
+    let (tmp, mut file) = loop {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u32(attempt);
+        let tmp = path.with_extension(format!("{ext}.{:08x}.zquig-tmp", h.finish() as u32));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, mode.unwrap_or(0o666));
+        #[cfg(not(unix))]
+        let _ = mode;
+        match options.open(&tmp) {
+            Ok(f) => break (tmp, f),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 10 => attempt += 1,
+            Err(e) => return Err(e.to_string()),
+        }
+    };
+    let written = file.write_all(data).and_then(|_| file.sync_all());
+    drop(file);
+    written.and_then(|_| std::fs::rename(&tmp, path)).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         e.to_string()
     })
@@ -161,22 +192,22 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
 
 // MARK: Clipboard images
 
+/// One clipboard connection for the app's lifetime. On Linux, what Zquig copies is served by
+/// this connection, so it must outlive the copy (a fresh one per copy would take it away again).
+pub fn with_clipboard<R>(f: impl FnOnce(&mut arboard::Clipboard) -> R) -> Option<R> {
+    static CLIPBOARD: OnceLock<Option<Mutex<arboard::Clipboard>>> = OnceLock::new();
+    let clip = CLIPBOARD.get_or_init(|| arboard::Clipboard::new().ok().map(Mutex::new)).as_ref()?;
+    Some(f(&mut clip.lock().unwrap_or_else(|e| e.into_inner())))
+}
+
 pub fn clipboard_image() -> Option<Pixmap> {
-    let img = arboard::Clipboard::new().ok()?.get_image().ok()?;
+    let img = with_clipboard(|c| c.get_image())?.ok()?;
     // Same ceiling as file decoding (about 600 MB of pixels).
     if img.width.checked_mul(img.height).is_none_or(|n| n > 150_000_000) {
         return None;
     }
     let rgba = RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned())?;
     pixmap_from_rgba(rgba)
-}
-
-pub fn clipboard_has_image() -> bool {
-    use clipboard_win::{formats, raw};
-    raw::is_format_avail(formats::CF_DIB)
-        || raw::is_format_avail(formats::CF_DIBV5)
-        || raw::is_format_avail(formats::CF_BITMAP)
-        || raw::register_format("PNG").is_some_and(|f| raw::is_format_avail(f.get()))
 }
 
 pub fn copy_image(pix: &Pixmap) -> Result<(), String> {
@@ -186,87 +217,9 @@ pub fn copy_image(pix: &Pixmap) -> Result<(), String> {
         height: img.height() as usize,
         bytes: std::borrow::Cow::Owned(img.into_raw()),
     };
-    arboard::Clipboard::new().and_then(|mut c| c.set_image(data)).map_err(|e| e.to_string())
-}
-
-// MARK: PDF (Windows' built-in renderer)
-
-/// Stacks up to 50 pages vertically into a single image. Returns the image and its scale (pixels per point).
-pub fn render_pdf(path: &Path) -> Result<(Pixmap, f32), String> {
-    use windows::Data::Pdf::{PdfDocument, PdfPageRenderOptions};
-    use windows::Storage::StorageFile;
-    use windows::Storage::Streams::{DataReader, InMemoryRandomAccessStream};
-    use windows::core::HSTRING;
-
-    let _com = unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED) };
-    let encrypted = |e: windows::core::Error| {
-        // ERROR_WRONG_PASSWORD
-        if e.code().0 as u32 == 0x8007_052B { "Cannot open encrypted PDF".to_string() } else { e.message().to_string() }
-    };
-    let file = StorageFile::GetFileFromPathAsync(&HSTRING::from(path.as_os_str()))
-        .and_then(|op| op.join())
-        .map_err(|e| e.message().to_string())?;
-    let doc = PdfDocument::LoadFromFileAsync(&file).and_then(|op| op.join()).map_err(encrypted)?;
-    if doc.IsPasswordProtected().unwrap_or(false) {
-        return Err("Cannot open encrypted PDF".into());
-    }
-    let count = doc.PageCount().map_err(|e| e.message().to_string())?.min(50);
-    if count == 0 {
-        return Err("The PDF has no pages.".into());
-    }
-    let mut pages = Vec::new();
-    for i in 0..count {
-        let page = doc.GetPage(i).map_err(|e| e.message().to_string())?;
-        let size = page.Size().map_err(|e| e.message().to_string())?;
-        pages.push((page, size.Width, size.Height));
-    }
-    let width = pages.iter().map(|p| p.1).fold(0.0, f32::max);
-    let gap = 12.0;
-    let height = pages.iter().map(|p| p.2).sum::<f32>() + gap * (pages.len() - 1) as f32;
-    // 2x like the Mac app, but keep long documents and oversized pages within a sane bitmap
-    // (at most 20,000 px on a side and about 600 MB of pixels).
-    if !(width.is_finite() && height.is_finite()) || width <= 0.0 || height <= 0.0 {
-        return Err("The PDF's page size is invalid.".into());
-    }
-    let scale = 2.0f32
-        .min(20_000.0 / height)
-        .min(20_000.0 / width)
-        .min((150_000_000.0 / (width * height)).sqrt());
-    if (width * scale) < 1.0 || (height * scale) < 1.0 {
-        return Err("The PDF's pages are too large to open.".into());
-    }
-    let mut out = blank((width * scale).ceil() as u32, (height * scale).ceil() as u32);
-
-    let mut top = 0.0;
-    for (page, w, h) in &pages {
-        let stream = InMemoryRandomAccessStream::new().map_err(|e| e.message().to_string())?;
-        let opts = PdfPageRenderOptions::new().map_err(|e| e.message().to_string())?;
-        let _ = opts.SetDestinationWidth((w * scale).round() as u32);
-        let _ = opts.SetDestinationHeight((h * scale).round() as u32);
-        page.RenderWithOptionsToStreamAsync(&stream, &opts)
-            .and_then(|op| op.join())
-            .map_err(|e| e.message().to_string())?;
-        let len = stream.Size().map_err(|e| e.message().to_string())? as u32;
-        let reader = DataReader::CreateDataReader(&stream.GetInputStreamAt(0).map_err(|e| e.message().to_string())?)
-            .map_err(|e| e.message().to_string())?;
-        reader.LoadAsync(len).and_then(|op| op.join()).map_err(|e| e.message().to_string())?;
-        let mut bytes = vec![0u8; len as usize];
-        reader.ReadBytes(&mut bytes).map_err(|e| e.message().to_string())?;
-        let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?.to_rgba8();
-        if let Some(pm) = pixmap_from_rgba(img) {
-            let x = ((width - w) / 2.0 * scale).round() as i32;
-            out.draw_pixmap(
-                x,
-                (top * scale).round() as i32,
-                pm.as_ref(),
-                &tiny_skia::PixmapPaint::default(),
-                tiny_skia::Transform::identity(),
-                None,
-            );
-        }
-        top += h + gap;
-    }
-    Ok((out, scale))
+    with_clipboard(|c| c.set_image(data))
+        .ok_or_else(|| "The clipboard isn't available.".to_string())?
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -294,7 +247,7 @@ mod tests {
             let px = back.pixel(20, 20).unwrap();
             assert!(px.red() > 150 && px.green() < 80, "{ext}: {px:?}");
         }
-        // PDF: written by hand, read back with Windows' own PDF renderer.
+        // PDF: written by hand, read back with the platform's PDF renderer.
         let pdf = dir.join("t.pdf");
         save(&img, 1.0, &pdf).unwrap();
         let (back, scale) = render_pdf(&pdf).unwrap();
@@ -302,6 +255,24 @@ mod tests {
         assert_eq!((back.width(), back.height()), (240, 160));
         let px = back.pixel(40, 40).unwrap();
         assert!(px.red() > 150 && px.green() < 80, "pdf: {px:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_never_follows_a_planted_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("zquig-test-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, b"keep").unwrap();
+        // Symlinks at the old, predictable temporary names must not be written through.
+        let target = dir.join("shot.jpg");
+        std::os::unix::fs::symlink(&victim, dir.join("shot.jpg.zquig-tmp")).unwrap();
+        write_private(&target, b"data").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert_eq!(std::fs::read(&target).unwrap(), b"data");
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o600);
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -14,6 +14,7 @@ use crate::annotation::{Annotation, Rgba, Tool, font_size};
 use crate::canvas::Canvas;
 use crate::capture::Mode;
 use crate::imageio;
+use crate::os;
 use crate::system::Prefs;
 use crate::tiles::Tiles;
 
@@ -237,14 +238,16 @@ impl Document {
                 self.style_button(ui, actions);
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let drag = ui
-                        .add(egui::Button::new(RichText::new(icon::EXPORT).size(18.0)).min_size(vec2(30.0, 28.0)).sense(Sense::click_and_drag()))
-                        .on_hover_text("Drag the annotated image into another app");
-                    if drag.hovered() {
-                        ui.ctx().set_cursor_icon(CursorIcon::Grab);
-                    }
-                    if drag.drag_started() {
-                        self.drag_out(ui, window);
+                    if os::CAN_DRAG_OUT {
+                        let drag = ui
+                            .add(egui::Button::new(RichText::new(icon::EXPORT).size(18.0)).min_size(vec2(30.0, 28.0)).sense(Sense::click_and_drag()))
+                            .on_hover_text("Drag the annotated image into another app");
+                        if drag.hovered() {
+                            ui.ctx().set_cursor_icon(CursorIcon::Grab);
+                        }
+                        if drag.drag_started() {
+                            self.drag_out(ui, window);
+                        }
                     }
                     let save = egui::Button::new(RichText::new(icon::FLOPPY_DISK).size(18.0)).min_size(vec2(30.0, 28.0));
                     if ui.add(save).on_hover_text("Save (Ctrl+S)").clicked() {
@@ -590,21 +593,10 @@ impl Document {
 
     // MARK: Clipboard
 
-    fn annotation_format() -> Option<u32> {
-        clipboard_win::raw::register_format("Zquig.Annotation").map(|f| f.get())
-    }
-
     /// Ctrl+C: copy the selected object; with nothing selected, copy the whole annotated image.
     fn copy(&mut self) {
         let Some(a) = self.canvas.selected_annotation().cloned() else { return self.copy_image() };
-        let Some(fmt) = Self::annotation_format() else { return };
-        if let Ok(_clip) = clipboard_win::Clipboard::new_attempts(10) {
-            let _ = clipboard_win::raw::empty();
-            let _ = clipboard_win::raw::set_without_clear(fmt, a.to_json().as_bytes());
-            if a.kind == Tool::Text {
-                let _ = clipboard_win::raw::set_string_with(&a.text, clipboard_win::options::NoClear);
-            }
-        }
+        os::copy_annotation(&a.to_json(), (a.kind == Tool::Text).then_some(a.text.as_str()));
         self.canvas.reset_paste_offset();
     }
 
@@ -617,19 +609,13 @@ impl Document {
 
     /// Ctrl+V: paste a copied object, or text as a new text object, or open a clipboard image in a new window.
     fn paste(&mut self, actions: &mut Vec<Action>) {
-        if let Some(fmt) = Self::annotation_format()
-            && clipboard_win::raw::is_format_avail(fmt)
-        {
-            let mut buf = Vec::new();
-            let got = clipboard_win::Clipboard::new_attempts(10).is_ok_and(|_c| clipboard_win::raw::get_vec(fmt, &mut buf).is_ok());
-            if got && let Some(a) = std::str::from_utf8(&buf).ok().and_then(|s| Annotation::from_json(s.trim_end_matches('\0'))) {
-                self.canvas.paste_annotation(a);
-                return;
-            }
+        if let Some(a) = os::pasted_annotation().and_then(|s| Annotation::from_json(&s)) {
+            self.canvas.paste_annotation(a);
+            return;
         }
         if imageio::clipboard_has_image() {
             actions.push(Action::NewFromClipboard);
-        } else if let Some(s) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok()).filter(|s| !s.is_empty()) {
+        } else if let Some(s) = imageio::with_clipboard(|c| c.get_text().ok()).flatten().filter(|s| !s.is_empty()) {
             self.canvas.paste_text(s, self.visible);
         } else {
             beep();
@@ -657,7 +643,7 @@ impl Document {
             return;
         }
         let thumb = thumbnail_png(&self.canvas.flattened(), 96);
-        let _ = drag::start_drag(window, drag::DragItem::Files(vec![path]), drag::Image::Raw(thumb), |_, _| {}, drag::Options::default());
+        os::start_drag(window, path, thumb);
         // The receiver may read the file lazily; tidy up a little later.
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(30));
@@ -758,11 +744,7 @@ fn thumbnail_png(pix: &Pixmap, max: u32) -> Vec<u8> {
     out.into_inner()
 }
 
-pub fn beep() {
-    unsafe {
-        let _ = windows::Win32::System::Diagnostics::Debug::MessageBeep(windows::Win32::UI::WindowsAndMessaging::MB_OK);
-    }
-}
+pub use crate::os::beep;
 
 pub fn error_box(parent: Option<&Window>, title: &str, detail: &str) {
     let mut d = rfd::MessageDialog::new().set_level(rfd::MessageLevel::Error).set_title("Zquig").set_description(format!("{title}\n\n{detail}"));

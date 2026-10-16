@@ -1,13 +1,12 @@
 # Advisories reviewed and accepted. Each needs a reason; anything new still fails the audit.
 [advisories]
 ignore = [
-    # proc-macro-error is unmaintained. Linux-only (pulled in by GTK for the tray and file dialogs);
-    # not part of the Windows build.
+    # proc-macro-error is unmaintained, and glib has an unsound VariantStrIter. Both are in
+    # Cargo.lock only through `drag`'s GTK backend: `drag` is a Windows-only dependency, so neither
+    # is compiled into Zquig (the Linux build uses GTK's C dialogs through rfd, not gtk-rs).
     "RUSTSEC-2024-0370",
-    # glib VariantStrIter unsoundness. Linux-only (GTK); not part of the Windows build, and Zquig
-    # doesn't use that API.
     "RUSTSEC-2024-0429",
-    # ttf-parser is unmaintained (no known vulnerability). It only parses the fonts installed in
-    # Windows, never fonts from documents or other outside sources.
+    # ttf-parser is unmaintained (no known vulnerability). It only parses the system's installed
+    # fonts (found through fontconfig), never fonts from documents or other outside sources.
     "RUSTSEC-2026-0192",
 ]

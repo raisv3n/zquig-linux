@@ -6,6 +6,10 @@ use image::imageops::FilterType;
 fn main() {
     println!("cargo:rerun-if-changed=assets/icon.png");
     println!("cargo:rerun-if-changed=assets/zquig.manifest");
+    // The icon and manifest are Windows resources; Linux gets its icon from the desktop entry.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     // The repo keeps a single PNG icon; build the multi-size .ico Windows wants from it.

@@ -15,6 +15,8 @@ pub struct Overlay {
     pub desktop: Desktop,
     pub mode: Mode,
     pub outcome: Option<Outcome>,
+    /// Set once the overlay has the keyboard (see `os::grab_keyboard`).
+    pub keyboard_grabbed: bool,
     tiles: Option<Tiles>,
     window_mode: bool,
     start: Option<Pos2>,
@@ -22,7 +24,7 @@ pub struct Overlay {
 
 impl Overlay {
     pub fn new(desktop: Desktop, mode: Mode) -> Self {
-        Self { desktop, mode, outcome: None, tiles: None, window_mode: mode == Mode::WindowToEditor, start: None }
+        Self { desktop, mode, outcome: None, keyboard_grabbed: false, tiles: None, window_mode: mode == Mode::WindowToEditor, start: None }
     }
 
     fn window_at(&self, p: Pos2) -> Option<Rect> {
