@@ -11,11 +11,11 @@ license-file = "LICENSE"
 [dependencies]
 arboard = "3.7.0"
 cosmic-text = "0.19.0"
-egui = "0.36"
+egui = "0.37"
 egui-phosphor = "0.14.0"
-egui-wgpu = { version = "0.36", features = ["winit"] }
-egui-winit = "0.36"
-global-hotkey = "0.8.0"
+egui-wgpu = { version = "0.37", features = ["winit"] }
+egui-winit = "0.37"
+global-hotkey = "0.9.0"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "tiff", "bmp", "gif", "webp", "ico"] }
 interprocess = "2.4.5"
 miniz_oxide = "0.9.1"
@@ -40,7 +40,7 @@ rfd = { version = "0.17.2", default-features = false, features = ["gtk3"] }
 tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
 # Keyboard grab for the capture overlay, on winit's own Xlib connection (winit already loads x11-dl).
 x11-dl = "2.21"
-x11rb = { version = "0.13", features = ["randr", "xfixes", "xtest"] }
+x11rb = { version = "0.14", features = ["randr", "xfixes", "xtest"] }
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
